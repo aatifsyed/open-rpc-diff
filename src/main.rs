@@ -225,6 +225,7 @@ mod summary {
 
     #[derive(Serialize)]
     pub struct Summary {
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         pub methods: BTreeMap<String, MethodChange>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub left: Vec<String>,
