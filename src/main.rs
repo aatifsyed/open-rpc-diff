@@ -1,10 +1,11 @@
 use std::{
     cmp,
     collections::{
-        btree_set::{Difference, Union},
+        btree_set::{Difference, Intersection},
         BTreeMap, BTreeSet,
     },
     fs::File,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -14,9 +15,10 @@ use itertools::{EitherOrBoth, Itertools as _};
 use json_schema_diff::Change;
 use nunny::NonEmpty;
 use openrpc_types::{ContentDescriptor, Method, OpenRPC, SpecificationExtensions};
-use schemars::schema::Schema;
+use schemars::schema::{RootSchema, Schema};
 use serde::Serialize;
 use serde_json::Value;
+use summary::{MethodChange, Summary};
 
 const NO_DESCRIPTOR: &ContentDescriptor = &ContentDescriptor {
     name: String::new(),
@@ -43,7 +45,9 @@ fn main() -> anyhow::Result<()> {
     let left_names = left_methods.keys().collect();
     let right_names = right_methods.keys().collect();
 
-    let (only_left, common, only_right) = sets(&left_names, &right_names);
+    let (only_left, common, only_right) = venn(&left_names, &right_names);
+
+    let mut methods = BTreeMap::new();
 
     for method in common {
         let (left_params, left_return) = &left_methods[*method];
@@ -78,25 +82,26 @@ fn main() -> anyhow::Result<()> {
         if param_diffs.is_none() && result_diff.is_none() {
             continue;
         }
-        println!("method {}", method);
-        for (ix, it) in param_diffs.into_iter().flatten() {
-            println!("\tparameter {}: {:?}", ix, it)
-        }
-        if let Some(it) = result_diff {
-            println!("\tresult: {:?}", it)
-        }
-        println!()
+        methods.insert(
+            (*method).clone(),
+            MethodChange {
+                parameter: param_diffs
+                    .into_iter()
+                    .flatten()
+                    .map(|(ix, it)| (ix, it.into()))
+                    .collect(),
+                result: result_diff.map(Into::into),
+            },
+        );
     }
 
-    for (methods, ident) in [(only_left, "left"), (only_right, "right")] {
-        if let Ok(methods) = nunny::Vec::new(methods.collect()) {
-            println!("the following methods are only present on the {}:", ident);
-            for it in methods {
-                println!("\t{}", it)
-            }
-            println!()
-        }
-    }
+    let summary = Summary {
+        methods,
+        left: only_left.map(|it| (*it).clone()).collect(),
+        right: only_right.map(|it| (*it).clone()).collect(),
+    };
+
+    serde_yaml::to_writer(io::stdout(), &summary)?;
 
     Ok(())
 }
@@ -123,7 +128,8 @@ fn prepare(
     Ok((definitions, methods))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
 enum RequiredChange {
     /// left was [`ContentDescriptor::required`], but right was not
     Left,
@@ -137,30 +143,18 @@ fn diff(
     left_definitions: &BTreeMap<String, Schema>,
     right_definitions: &BTreeMap<String, Schema>,
 ) -> Option<EitherOrBoth<NonEmpty<Vec<Change>>, RequiredChange>> {
-    #[derive(Serialize)]
-    struct Combine<'a> {
-        #[serde(flatten)]
-        schema: &'a Schema,
-        #[serde(flatten)]
-        definitions: &'a BTreeMap<String, Schema>,
-    }
-    impl Combine<'_> {
-        fn to_json(&self) -> Value {
-            serde_json::to_value(self).unwrap()
-        }
+    fn json(schema: &Schema, definitions: &BTreeMap<String, Schema>) -> Value {
+        serde_json::to_value(&RootSchema {
+            meta_schema: None,
+            schema: schema.clone().into_object(),
+            definitions: definitions.clone(),
+        })
+        .unwrap()
     }
     let schema_change = nunny::Vec::new(
         json_schema_diff::diff(
-            Combine {
-                schema: &left.schema,
-                definitions: left_definitions,
-            }
-            .to_json(),
-            Combine {
-                schema: &right.schema,
-                definitions: right_definitions,
-            }
-            .to_json(),
+            json(&left.schema, left_definitions),
+            json(&right.schema, right_definitions),
         )
         .unwrap(),
     )
@@ -182,13 +176,13 @@ fn diff(
     }
 }
 
-fn sets<'a, T: Ord>(
+fn venn<'a, T: Ord>(
     left: &'a BTreeSet<T>,
     right: &'a BTreeSet<T>,
-) -> (Difference<'a, T>, Union<'a, T>, Difference<'a, T>) {
+) -> (Difference<'a, T>, Intersection<'a, T>, Difference<'a, T>) {
     let only_left = left.difference(right);
     let only_right = right.difference(left);
-    let common = left.union(right);
+    let common = left.intersection(right);
     (only_left, common, only_right)
 }
 
@@ -214,11 +208,131 @@ fn method(method: Method) -> (String, (Vec<ContentDescriptor>, Option<ContentDes
 fn read(path: impl AsRef<Path>) -> anyhow::Result<OpenRPC> {
     let file = File::open(path.as_ref())
         .context(format!("couldn't open file {}", path.as_ref().display()))?;
-    serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_reader(file))
-        .map_err(Into::into)
+    serde_path_to_error::deserialize(&mut serde_json::Deserializer::from_reader(file)).context(
+        format!("couldn't deserialize file {}", path.as_ref().display()),
+    )
 }
 
-pub mod rewrite_schema_references {
+mod summary {
+    use super::RequiredChange;
+    use std::collections::BTreeMap;
+
+    use itertools::EitherOrBoth;
+    use json_schema_diff::JsonSchemaType;
+    use nunny::NonEmpty;
+    use serde::Serialize;
+    use serde_json::Value;
+
+    #[derive(Serialize)]
+    pub struct Summary {
+        pub methods: BTreeMap<String, MethodChange>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub left: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub right: Vec<String>,
+    }
+
+    #[derive(Serialize)]
+    pub struct MethodChange {
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        pub parameter: BTreeMap<usize, ContentDescriptorChange>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub result: Option<ContentDescriptorChange>,
+    }
+
+    #[derive(Serialize)]
+    pub struct ContentDescriptorChange {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub changes: Vec<Change>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub required: Option<RequiredChange>,
+    }
+
+    #[derive(Serialize)]
+    pub struct Change {
+        #[serde(skip_serializing_if = "String::is_empty")]
+        pub path: String,
+        pub kind: ChangeKind,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum ChangeKind {
+        TypeAdd(JsonSchemaType),
+        TypeRemove(JsonSchemaType),
+        ConstAdd(Value),
+        ConstRemove(Value),
+        PropertyAdd(String),
+        PropertyRemove(String),
+        RangeAdd,
+        RangeRemove,
+        RangeChange,
+        TupleToArray,
+        ArrayToTuple,
+        TupleChange,
+        RequiredRemove(String),
+        RequiredAdd(String),
+    }
+
+    impl From<json_schema_diff::Change> for Change {
+        fn from(value: json_schema_diff::Change) -> Self {
+            let json_schema_diff::Change { path, change } = value;
+            Self {
+                path,
+                kind: change.into(),
+            }
+        }
+    }
+
+    impl From<json_schema_diff::ChangeKind> for ChangeKind {
+        fn from(value: json_schema_diff::ChangeKind) -> Self {
+            use json_schema_diff::ChangeKind as Th;
+            match value {
+                Th::TypeAdd { added } => Self::TypeAdd(added),
+                Th::TypeRemove { removed } => Self::TypeRemove(removed),
+                Th::ConstAdd { added } => Self::ConstAdd(added),
+                Th::ConstRemove { removed } => Self::ConstRemove(removed),
+                Th::PropertyAdd {
+                    lhs_additional_properties: _,
+                    added,
+                } => Self::PropertyAdd(added),
+                Th::PropertyRemove {
+                    lhs_additional_properties: _,
+                    removed,
+                } => Self::PropertyRemove(removed),
+                Th::RangeAdd { added: _ } => Self::RangeAdd,
+                Th::RangeRemove { removed: _ } => Self::RangeRemove,
+                Th::RangeChange {
+                    old_value: _,
+                    new_value: _,
+                } => Self::RangeChange,
+                Th::TupleToArray { old_length: _ } => Self::TupleToArray,
+                Th::ArrayToTuple { new_length: _ } => Self::ArrayToTuple,
+                Th::TupleChange { new_length: _ } => Self::TupleChange,
+                Th::RequiredRemove { property } => Self::RequiredRemove(property),
+                Th::RequiredAdd { property } => Self::RequiredAdd(property),
+            }
+        }
+    }
+
+    impl From<EitherOrBoth<NonEmpty<Vec<json_schema_diff::Change>>, RequiredChange>>
+        for ContentDescriptorChange
+    {
+        fn from(
+            value: EitherOrBoth<NonEmpty<Vec<json_schema_diff::Change>>, RequiredChange>,
+        ) -> Self {
+            let (change, required) = value.left_and_right();
+            Self {
+                changes: change
+                    .map(|it| it.into_vec().into_iter().map(Into::into).collect())
+                    .unwrap_or_default(),
+                required,
+            }
+        }
+    }
+}
+
+mod rewrite_schema_references {
     use either::Either;
     use openrpc_types::{Components, ContentDescriptor, Method, OpenRPC};
     use schemars::schema::{
@@ -296,7 +410,6 @@ pub mod rewrite_schema_references {
                         *reference = format!("#/definitions/{}", path)
                     }
                 }
-
                 if let Some(SubschemaValidation {
                     all_of,
                     any_of,
