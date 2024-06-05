@@ -48,10 +48,13 @@ fn main() -> anyhow::Result<()> {
     let (only_left, common, only_right) = venn(&left_names, &right_names);
 
     let mut methods = BTreeMap::new();
+    let mut compatible = Vec::new();
 
     for method in common {
-        let (left_params, left_return) = &left_methods[*method];
-        let (right_params, right_return) = &right_methods[*method];
+        let method = (*method).clone();
+
+        let (left_params, left_return) = &left_methods[&method];
+        let (right_params, right_return) = &right_methods[&method];
 
         let common_length = cmp::max(left_params.len(), right_params.len());
 
@@ -80,10 +83,11 @@ fn main() -> anyhow::Result<()> {
         );
 
         if param_diffs.is_none() && result_diff.is_none() {
+            compatible.push(method);
             continue;
         }
         methods.insert(
-            (*method).clone(),
+            method,
             MethodChange {
                 parameter: param_diffs
                     .into_iter()
@@ -96,7 +100,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let summary = Summary {
-        methods,
+        equivalent: compatible,
+        different: methods,
         left: only_left.map(|it| (*it).clone()).collect(),
         right: only_right.map(|it| (*it).clone()).collect(),
     };
@@ -225,8 +230,10 @@ mod summary {
 
     #[derive(Serialize)]
     pub struct Summary {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        pub equivalent: Vec<String>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        pub methods: BTreeMap<String, MethodChange>,
+        pub different: BTreeMap<String, MethodChange>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         pub left: Vec<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -254,64 +261,80 @@ mod summary {
         #[serde(skip_serializing_if = "String::is_empty")]
         pub path: String,
         pub kind: ChangeKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub of: Option<Subject>,
+    }
+
+    #[derive(Serialize)]
+    #[serde(untagged)]
+    pub enum Subject {
+        Type(JsonSchemaType),
+        Const(Value),
+        Property(String),
     }
 
     #[derive(Serialize)]
     #[serde(rename_all = "kebab-case")]
     pub enum ChangeKind {
-        TypeAdd(JsonSchemaType),
-        TypeRemove(JsonSchemaType),
-        ConstAdd(Value),
-        ConstRemove(Value),
-        PropertyAdd(String),
-        PropertyRemove(String),
+        TypeAdd,
+        TypeRemove,
+        ConstAdd,
+        ConstRemove,
+        PropertyAdd,
+        PropertyRemove,
         RangeAdd,
         RangeRemove,
         RangeChange,
         TupleToArray,
         ArrayToTuple,
         TupleChange,
-        RequiredRemove(String),
-        RequiredAdd(String),
+        RequiredRemove,
+        RequiredAdd,
     }
 
     impl From<json_schema_diff::Change> for Change {
         fn from(value: json_schema_diff::Change) -> Self {
             let json_schema_diff::Change { path, change } = value;
-            Self {
-                path,
-                kind: change.into(),
-            }
-        }
-    }
 
-    impl From<json_schema_diff::ChangeKind> for ChangeKind {
-        fn from(value: json_schema_diff::ChangeKind) -> Self {
             use json_schema_diff::ChangeKind as Th;
-            match value {
-                Th::TypeAdd { added } => Self::TypeAdd(added),
-                Th::TypeRemove { removed } => Self::TypeRemove(removed),
-                Th::ConstAdd { added } => Self::ConstAdd(added),
-                Th::ConstRemove { removed } => Self::ConstRemove(removed),
+            let (kind, subject) = match change {
+                Th::TypeAdd { added } => (ChangeKind::TypeAdd, Some(Subject::Type(added))),
+                Th::TypeRemove { removed } => {
+                    (ChangeKind::TypeRemove, Some(Subject::Type(removed)))
+                }
+                Th::ConstAdd { added } => (ChangeKind::ConstAdd, Some(Subject::Const(added))),
+                Th::ConstRemove { removed } => {
+                    (ChangeKind::ConstRemove, Some(Subject::Const(removed)))
+                }
                 Th::PropertyAdd {
                     lhs_additional_properties: _,
                     added,
-                } => Self::PropertyAdd(added),
+                } => (ChangeKind::PropertyAdd, Some(Subject::Property(added))),
                 Th::PropertyRemove {
                     lhs_additional_properties: _,
                     removed,
-                } => Self::PropertyRemove(removed),
-                Th::RangeAdd { added: _ } => Self::RangeAdd,
-                Th::RangeRemove { removed: _ } => Self::RangeRemove,
+                } => (ChangeKind::PropertyRemove, Some(Subject::Property(removed))),
+                Th::RangeAdd { added: _ } => (ChangeKind::RangeAdd, None),
+                Th::RangeRemove { removed: _ } => (ChangeKind::RangeRemove, None),
                 Th::RangeChange {
                     old_value: _,
                     new_value: _,
-                } => Self::RangeChange,
-                Th::TupleToArray { old_length: _ } => Self::TupleToArray,
-                Th::ArrayToTuple { new_length: _ } => Self::ArrayToTuple,
-                Th::TupleChange { new_length: _ } => Self::TupleChange,
-                Th::RequiredRemove { property } => Self::RequiredRemove(property),
-                Th::RequiredAdd { property } => Self::RequiredAdd(property),
+                } => (ChangeKind::RangeChange, None),
+                Th::TupleToArray { old_length: _ } => (ChangeKind::TupleToArray, None),
+                Th::ArrayToTuple { new_length: _ } => (ChangeKind::ArrayToTuple, None),
+                Th::TupleChange { new_length: _ } => (ChangeKind::TupleChange, None),
+                Th::RequiredRemove { property } => (
+                    ChangeKind::RequiredRemove,
+                    Some(Subject::Property(property)),
+                ),
+                Th::RequiredAdd { property } => {
+                    (ChangeKind::RequiredAdd, Some(Subject::Property(property)))
+                }
+            };
+            Self {
+                path,
+                kind,
+                of: subject,
             }
         }
     }
